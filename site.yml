@@ -1,0 +1,120 @@
+---
+- name: Prepare all nodes
+  hosts: all
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - wget
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - software-properties-common
+        update_cache: yes
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Ensure swap is disabled permanently
+      replace:
+        path: /etc/fstab
+        regexp: '(^[^#].*\bswap\b.*)'
+        replace: '# \1'
+
+    - name: Enable required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Ensure modules are loaded on boot
+      copy:
+        dest: /etc/modules-load.d/k3s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configure sysctl params
+      copy:
+        dest: /etc/sysctl.d/90-k3s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+      notify: Reload sysctl
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+
+
+- name: Install K3s master nodes
+  hosts: masters
+  tasks:
+    - name: Ensure master has a unique hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Check if K3s server is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Install first K3s master (cluster init)
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        INSTALL_K3S_EXEC="server --cluster-init --disable traefik --write-kubeconfig-mode 644 \
+        --cluster-cidr={{ k3s_cluster_cidr }} --service-cidr={{ k3s_service_cidr }}" sh -s - --with-node-id
+      when: inventory_hostname == groups['masters'][0] and not k3s_binary.stat.exists
+
+    - name: Fetch cluster join token from first master
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: token_file
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Set fact for join token
+      set_fact:
+        k3s_token: "{{ token_file['content'] | b64decode | trim }}"
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Distribute join token to all nodes
+      add_host:
+        name: "{{ item }}"
+        k3s_token: "{{ k3s_token }}"
+      loop: "{{ groups['masters'] + groups['workers'] }}"
+      when: inventory_hostname == groups['masters'][0]
+
+    - name: Install remaining masters (join cluster)
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        K3S_URL=https://{{ hostvars[groups['masters'][0]]['ansible_host'] }}:6443 \
+        K3S_TOKEN={{ hostvars[groups['masters'][0]]['k3s_token'] }} \
+        INSTALL_K3S_VERSION={{ k3s_version }} \
+        INSTALL_K3S_EXEC="server --disable traefik" sh -s - --with-node-id
+      when: inventory_hostname != groups['masters'][0] and not k3s_binary.stat.exists
+
+
+- name: Install K3s workers
+  hosts: workers
+  tasks:
+    - name: Ensure worker has a unique hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Check if K3s agent is already installed
+      stat:
+        path: /usr/local/bin/k3s-agent
+      register: k3s_agent
+
+    - name: Install K3s worker node
+      shell: |
+        curl -sfL https://get.k3s.io | K3S_URL=https://{{ hostvars[groups['masters'][0]]['ansible_host'] }}:6443 K3S_TOKEN={{ hostvars[groups['masters'][0]]['k3s_token'] }} INSTALL_K3S_VERSION={{ k3s_version }} sh -s - --with-node-id
+      when: not k3s_agent.stat.exists
+
+    
